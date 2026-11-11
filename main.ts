@@ -40,6 +40,12 @@ const ATR_MIN_BPS = 6;
 const MIN_COOLDOWN_BARS = 3;  // bars to skip after any exit before re-entering
 const MAX_HOLD_BARS     = 90; // time-stop: exit after 90 minutes if still in
 
+// Pool depth guard: skip entry when pool is too shallow (high impact).
+// A $1,000 buy on a pool of depth D moves price by ~1000/D bps.
+// Refuse entry when estimated impact > 15 bps (pool depth < 66,667 USDC).
+const MAX_IMPACT_BPS = 15n;    // bigint for integer pool-depth math
+const STAKE_USDC_RAW = 1_000_000_000n; // 1,000 USDC in raw quote units (6 dp)
+
 // bigint ratios for PnL checks (cost already includes buy fee)
 const STOP_N   = 982n;  const STOP_D   = 1000n;  // hard stop at −1.8%
 const TARGET_N = 1030n; const TARGET_D = 1000n;  // take profit at +3.0%
@@ -162,12 +168,17 @@ function push(bar: Bar): Signal {
 
   // entry: triple EMA aligned + RSI zone + positive ROC + sufficient ATR
   const atrOk = atrVal !== null && c > 0 && (atrVal / c) * 10_000 >= ATR_MIN_BPS;
+  // depth guard: skip entry when pool is too shallow to absorb the trade cheaply.
+  // impact_bps ≈ stake * 10_000 / depth; allow when impact <= MAX_IMPACT_BPS.
+  const depthRaw = bar.c_depth.length > 0 ? BigInt(bar.c_depth[0]!) : 0n;
+  const depthOk  = depthRaw === 0n || STAKE_USDC_RAW * 10_000n <= MAX_IMPACT_BPS * depthRaw;
   if (
     fastAboveMid &&
     mid.value > slow.value &&
     rsiVal !== null && rsiVal >= RSI_ENTRY_LO && rsiVal <= RSI_ENTRY_HI &&
     roc !== null && roc > 0 &&
-    atrOk
+    atrOk &&
+    depthOk
   ) return 'up';
 
   return null;
