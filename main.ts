@@ -1,61 +1,63 @@
-// MACD-Histogram Momentum + Oversold-Bounce bot for 1-minute cbBTC/USDC.
+// Trend-Filtered Oversold Reversal bot for 1-minute cbBTC/USDC.
 //
-// Two entry modes — fundamentally different from EMA-crossover strategies:
+// Core insight: on 1-minute BTC, complex indicators generate too many signals.
+// Every false entry costs ~26 bps in fees. This bot waits for EXTREME conditions
+// before acting, targeting 2-5 high-conviction trades per day.
 //
-//   MODE A  Oversold Bounce (mean reversion)
-//     Fires when price is statistically cheap (Z-score < −1.5 vs 20-bar mean),
-//     RSI(14) < 38, and the MACD histogram just turned positive (momentum
-//     starting to reverse).  Expects price to snap back toward the mean.
-//     Exit: Z-score > 0.4, RSI > 70, MACD histogram turns negative, stop or target.
+// Regime filter — EMA(50) vs EMA(100):
+//   Uptrend:   EMA50 > EMA100 × 1.0003   → allow both entry modes
+//   Sideways:  EMA50 within ±0.03% of EMA100 → allow oversold-only entries
+//   Downtrend: EMA50 < EMA100 × 0.9997   → NO ENTRY (can't short; preserve capital)
 //
-//   MODE B  Momentum Burst (trend following)
-//     Fires when the MACD histogram is positive AND accelerating for two
-//     consecutive bars AND RSI is in the momentum zone (50–66) AND
-//     Bollinger %B > 0.55 (price in the upper half of the bands).
-//     Rides the momentum burst until it fades.
-//     Exit: MACD histogram cross to negative, RSI > 72, stop or target.
+// Entry (all conditions must hold simultaneously):
+//   1. Regime is Uptrend or Sideways
+//   2. RSI(14) < 30  — price is deeply oversold
+//   3. Close < Lower Bollinger Band(20, 2σ) — statistically cheap
+//   4. MACD(5,15,5) histogram just crossed from ≤0 to >0 — momentum turning
+//   5. No active cooldown
 //
-//   Volatility gate: ATR(14)/price < 4 bps → skip (flat market, fees dominate).
-//   Cooldown: 3 bars after any exit before re-entering.
-//   Time-stop: exit after 75 bars regardless.
-//   Hard stop: −1.6%.  Take-profit: +2.2%.
+// Exit (first trigger):
+//   1. RSI(14) > 65           — recovery complete
+//   2. Close > Middle BB      — price returned to mean
+//   3. MACD histogram turns negative (crosses from ≥0 to <0) — momentum fading
+//   4. value < cost × 988/1000  — hard stop −1.2%
+//   5. value > cost × 1020/1000 — take-profit +2.0%
+//   6. held ≥ 90 bars           — time-stop
 //
-//   Round-trip cost ≈ 26 bps.  Net target ≈ +1.94%.  Net stop ≈ −1.86%.
+// Round-trip cost ≈ 26 bps.  Net target ≈ +1.74%.  Net stop ≈ −1.46%.
+// Warmup: 100 bars (EMA100 needs this before any trades are possible).
 //
 // Deterministic: float64 IEEE-754 only, no Math.random, no Date, no I/O.
 
 import { BPS, runBars, type Bar, type BarsState, type BuyInput, type SellInput } from './vendor/makefun-bars.ts';
 
 // ── parameters ───────────────────────────────────────────────────────────────────
-const BB_PERIOD   = 20;
-const BB_MULT     = 2.0;
-const MACD_FAST   = 12;
-const MACD_SLOW   = 26;
-const MACD_SIG    = 9;
-const RSI_PERIOD  = 14;
-const ATR_PERIOD  = 14;
+const EMA_FAST_TREND = 50;
+const EMA_SLOW_TREND = 100;
+// Regime threshold: EMA50 / EMA100 ratio thresholds
+const UPTREND_RATIO   = 1.0003;  // EMA50 > EMA100 × this → uptrend
+const DOWNTREND_RATIO = 0.9997;  // EMA50 < EMA100 × this → downtrend
 
-// Mode A: oversold bounce
-const Z_ENTRY_A   = -1.5;  // Z-score below this → price is cheap
-const Z_EXIT_A    =  0.4;  // mean-reversion done when Z-score recovers here
-const RSI_A_MAX   = 38;    // must be oversold to enter mode A
+const RSI_PERIOD = 14;
+const RSI_ENTRY  = 30;   // deeply oversold threshold
+const RSI_EXIT   = 65;   // recovery threshold
 
-// Mode B: momentum burst
-const RSI_B_LO    = 50;
-const RSI_B_HI    = 66;
-const BB_B_MIN    = 0.55;  // Bollinger %B above midpoint
+const BB_PERIOD  = 20;
+const BB_MULT    = 2.0;
 
-// Shared exits
-const RSI_EXIT_A  = 70;
-const RSI_EXIT_B  = 72;
-const ATR_MIN_BPS = 4;     // volatility gate
+const MACD_FAST  = 5;
+const MACD_SLOW  = 15;
+const MACD_SIG   = 5;
 
-const COOLDOWN    = 3;
-const MAX_HOLD    = 75;
+const ATR_PERIOD = 14;
+const ATR_MIN_BPS = 3; // skip flat bars where there's no movement to capture
 
-// bigint ratios (cost already includes buy fee)
-const STOP_N   = 984n; const STOP_D   = 1000n;  // hard stop −1.6%
-const TARGET_N = 1022n; const TARGET_D = 1000n; // take profit +2.2%
+const COOLDOWN   = 4;   // bars to wait after any exit
+const MAX_HOLD   = 90;  // time-stop
+
+// bigint PnL check ratios (cost already includes buy fee)
+const STOP_N   = 988n; const STOP_D   = 1000n;  // hard stop −1.2%
+const TARGET_N = 1020n; const TARGET_D = 1000n; // take-profit +2.0%
 
 const MAX_SLIPPAGE_BPS = 100;
 
@@ -78,8 +80,7 @@ function stepEma(e: Ema, v: number): void {
 function stepRsi(r: Rsi, c: number): number | null {
   if (r.prev !== null) {
     const d = c - r.prev;
-    const up = d > 0 ? d : 0;
-    const dn = d < 0 ? -d : 0;
+    const up = d > 0 ? d : 0, dn = d < 0 ? -d : 0;
     if (r.gain === null) {
       r.seed.push(d);
       if (r.seed.length === RSI_PERIOD) {
@@ -100,9 +101,7 @@ function stepRsi(r: Rsi, c: number): number | null {
 function stepAtr(a: Atr, bar: Bar): number | null {
   const h = Number(bar.h), l = Number(bar.l), c = Number(bar.c);
   let tr = h - l;
-  if (a.prev !== null) {
-    tr = Math.max(tr, Math.abs(h - a.prev), Math.abs(l - a.prev));
-  }
+  if (a.prev !== null) tr = Math.max(tr, Math.abs(h - a.prev), Math.abs(l - a.prev));
   a.prev = c;
   if (a.value !== null) {
     a.value = (a.value * (ATR_PERIOD - 1) + tr) / ATR_PERIOD;
@@ -115,31 +114,32 @@ function stepAtr(a: Atr, bar: Bar): number | null {
 
 // ── per-symbol state ──────────────────────────────────────────────────────────────
 
-type EntryMode = 'A' | 'B';
-type Signal = 'up-A' | 'up-B' | 'down' | null;
+type Signal = 'up' | 'down' | null;
 
 interface Series {
+  emaFast: Ema;   // EMA(50) trend
+  emaSlow: Ema;   // EMA(100) trend
+  macdF:   Ema;   // MACD fast EMA(5)
+  macdS:   Ema;   // MACD slow EMA(15)
+  macdSig: Ema;   // MACD signal EMA(5) of histogram
+  prevHist: number | null;
   rsi: Rsi;
   atr: Atr;
-  macdFast: Ema;
-  macdSlow: Ema;
-  macdSig:  Ema;
-  prevHist: number | null;
   bbCloses: number[];
-  mode: EntryMode | null;
+  midBB: number | null;
 }
 
-const allSeries    = new Map<string, Series>();
+const allSeries     = new Map<string, Series>();
 const cooldownUntil = new Map<string, number>();
-const entrySeq     = new Map<string, number>();
+const entrySeq      = new Map<string, number>();
 
 function getSeries(symbol: string): Series {
   let s = allSeries.get(symbol);
   if (s === undefined) {
     s = {
-      rsi: mkRsi(), atr: mkAtr(),
-      macdFast: mkEma(MACD_FAST), macdSlow: mkEma(MACD_SLOW), macdSig: mkEma(MACD_SIG),
-      prevHist: null, bbCloses: [], mode: null,
+      emaFast: mkEma(EMA_FAST_TREND), emaSlow: mkEma(EMA_SLOW_TREND),
+      macdF: mkEma(MACD_FAST), macdS: mkEma(MACD_SLOW), macdSig: mkEma(MACD_SIG),
+      prevHist: null, rsi: mkRsi(), atr: mkAtr(), bbCloses: [], midBB: null,
     };
     allSeries.set(symbol, s);
   }
@@ -149,71 +149,68 @@ function getSeries(symbol: string): Series {
 function computeSignal(bar: Bar, s: Series): Signal {
   const c = Number(bar.c);
 
+  // Trend EMAs
+  stepEma(s.emaFast, c);
+  stepEma(s.emaSlow, c);
+
+  // RSI
   const rsiVal = stepRsi(s.rsi, c);
+
+  // ATR
   const atrVal = stepAtr(s.atr, bar);
 
-  // MACD
-  stepEma(s.macdFast, c);
-  stepEma(s.macdSlow, c);
+  // MACD(5,15,5)
+  stepEma(s.macdF, c);
+  stepEma(s.macdS, c);
   let hist: number | null = null;
-  if (s.macdFast.value !== null && s.macdSlow.value !== null) {
-    const line = s.macdFast.value - s.macdSlow.value;
+  if (s.macdF.value !== null && s.macdS.value !== null) {
+    const line = s.macdF.value - s.macdS.value;
     stepEma(s.macdSig, line);
     if (s.macdSig.value !== null) hist = line - s.macdSig.value;
   }
   const prevHist = s.prevHist;
   s.prevHist = hist;
 
-  // Bollinger Bands + Z-score
+  // Bollinger Bands(20, 2σ)
   s.bbCloses.push(c);
   if (s.bbCloses.length > BB_PERIOD) s.bbCloses.shift();
-
-  let zScore: number | null = null;
-  let bbPct:  number | null = null;
-
+  let lowerBB: number | null = null;
+  s.midBB = null;
   if (s.bbCloses.length === BB_PERIOD) {
     const mean = s.bbCloses.reduce((a, x) => a + x, 0) / BB_PERIOD;
     const variance = s.bbCloses.reduce((a, x) => a + (x - mean) ** 2, 0) / BB_PERIOD;
     const std = Math.sqrt(variance);
-    if (std > 0) {
-      zScore = (c - mean) / std;
-      const lo = mean - BB_MULT * std;
-      const hi = mean + BB_MULT * std;
-      bbPct  = (c - lo) / (hi - lo);
-    }
+    s.midBB = mean;
+    lowerBB = mean - BB_MULT * std;
   }
 
-  // ── exits (checked even when not holding; onBatch gates by position) ──────────
-  if (rsiVal !== null) {
-    const rsiExitThresh = s.mode === 'A' ? RSI_EXIT_A : RSI_EXIT_B;
-    if (rsiVal > rsiExitThresh) return 'down';
-  }
-  // MACD histogram cross to negative → momentum lost
-  if (hist !== null && prevHist !== null && hist < 0 && prevHist >= 0) return 'down';
-  // Mode A extra exit: mean reversion done
-  if (s.mode === 'A' && zScore !== null && zScore > Z_EXIT_A) return 'down';
+  // ── exits ────────────────────────────────────────────────────────────────────
+  if (rsiVal !== null && rsiVal > RSI_EXIT) return 'down';
+  if (s.midBB !== null && c > s.midBB) return 'down'; // price returned to mean
+  if (hist !== null && prevHist !== null && hist < 0 && prevHist >= 0) return 'down'; // MACD fades
 
-  // Volatility gate
-  const atrOk = atrVal !== null && c > 0 && (atrVal / c) * 10_000 >= ATR_MIN_BPS;
-  if (!atrOk || rsiVal === null || hist === null || zScore === null || bbPct === null) return null;
+  // ── entry guards ─────────────────────────────────────────────────────────────
+  // Need all indicators warmed up
+  if (s.emaFast.value === null || s.emaSlow.value === null) return null;
+  if (rsiVal === null || hist === null || lowerBB === null) return null;
+  if (atrVal === null || c <= 0) return null;
 
-  // ── Mode A: oversold bounce ───────────────────────────────────────────────────
-  if (
-    zScore < Z_ENTRY_A &&                          // price statistically cheap
-    rsiVal < RSI_A_MAX &&                           // RSI oversold
-    hist > 0 &&                                     // MACD histogram just turned positive
-    prevHist !== null && prevHist <= 0              // confirmed cross from non-positive
-  ) return 'up-A';
+  // Volatility gate: skip if market is completely flat (fees dominate)
+  if ((atrVal / c) * 10_000 < ATR_MIN_BPS) return null;
 
-  // ── Mode B: momentum burst ────────────────────────────────────────────────────
-  if (
-    hist > 0 &&                                     // MACD bullish
-    prevHist !== null && hist > prevHist &&         // histogram accelerating
-    rsiVal >= RSI_B_LO && rsiVal <= RSI_B_HI &&    // RSI momentum zone
-    bbPct > BB_B_MIN                                // price in upper half of bands
-  ) return 'up-B';
+  // Regime filter
+  const ratio = s.emaFast.value / s.emaSlow.value;
+  if (ratio < DOWNTREND_RATIO) return null; // downtrend → no entry
 
-  return null;
+  // Entry: ALL three must be true
+  // 1. Deeply oversold RSI
+  if (rsiVal >= RSI_ENTRY) return null;
+  // 2. Price below lower Bollinger Band (statistically cheap)
+  if (c >= lowerBB) return null;
+  // 3. MACD histogram just crossed from ≤0 to >0 (momentum turning)
+  if (!(hist > 0 && prevHist !== null && prevHist <= 0)) return null;
+
+  return 'up';
 }
 
 function shouldExit(
@@ -225,8 +222,8 @@ function shouldExit(
 ): boolean {
   if (sig === 'down') return true;
   const val = state.value(symbol, held.qty);
-  if (val * STOP_D   <= held.cost * STOP_N)   return true; // −1.6% hard stop
-  if (val * TARGET_D >= held.cost * TARGET_N) return true; // +2.2% target
+  if (val * STOP_D   <= held.cost * STOP_N)   return true; // −1.2% stop
+  if (val * TARGET_D >= held.cost * TARGET_N) return true; // +2.0% target
   const entry = entrySeq.get(symbol);
   if (entry !== undefined && currentSeq - entry >= MAX_HOLD) return true;
   return false;
@@ -243,7 +240,7 @@ await runBars({
 
     const { caps, fees } = state.hello;
     const sells: SellInput[] = [];
-    const entries: Array<{ symbol: string; mode: EntryMode }> = [];
+    const entries: string[] = [];
 
     for (const { symbol } of state.hello.symbols) {
       if (!signals.has(symbol)) continue;
@@ -255,11 +252,10 @@ await runBars({
           sells.push({ side: 'sell', symbol, qty: held.qty, max_slippage_bps: MAX_SLIPPAGE_BPS });
           cooldownUntil.set(symbol, batch.seq + COOLDOWN);
           entrySeq.delete(symbol);
-          getSeries(symbol).mode = null;
         }
-      } else if (sig === 'up-A' || sig === 'up-B') {
+      } else if (sig === 'up') {
         const cooldown = cooldownUntil.get(symbol) ?? 0;
-        if (batch.seq >= cooldown) entries.push({ symbol, mode: sig === 'up-A' ? 'A' : 'B' });
+        if (batch.seq >= cooldown) entries.push(symbol);
       }
     }
 
@@ -270,14 +266,13 @@ await runBars({
     let room = slots - state.positions.size;
     let cash = state.cash;
 
-    for (const { symbol, mode } of entries) {
+    for (const symbol of entries) {
       if (room <= 0 || orders.length >= caps.max_orders_per_bar) break;
       let slice = stake < byWeight ? stake : byWeight;
       if (cash < slice) slice = cash;
       if (slice === 0n || slice < BigInt(fees.min_notional_quote_units)) break;
       orders.push({ side: 'buy', symbol, notional_quote_units: slice, max_slippage_bps: MAX_SLIPPAGE_BPS });
       entrySeq.set(symbol, batch.seq);
-      getSeries(symbol).mode = mode;
       cash -= slice;
       room--;
     }
